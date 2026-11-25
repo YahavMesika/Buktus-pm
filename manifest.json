@@ -1,0 +1,11 @@
+{
+  "name": "שלום בוקטוס · ניהול פרויקטים",
+  "short_name": "בוקטוס",
+  "lang": "he",
+  "dir": "rtl",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#F3F4F6",
+  "theme_color": "#1F2933",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

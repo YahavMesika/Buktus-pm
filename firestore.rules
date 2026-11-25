@@ -1,0 +1,17 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // רק מי שהמייל שלו ברשימה יכול לראות או לשנות משהו
+    function allowed() {
+      return request.auth != null
+        && request.auth.token.email.lower() in [
+          'amit@buktus.co.il',
+          'bar@buktus.co.il',
+          'yahavmesika@gmail.com'
+        ];
+    }
+    match /{document=**} {
+      allow read, write: if allowed();
+    }
+  }
+}
