@@ -4,12 +4,39 @@ import {
   getFirestore, collection, doc, onSnapshot, addDoc, setDoc, updateDoc, deleteDoc,
   serverTimestamp, writeBatch, query, orderBy, limit
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
-import { firebaseConfig } from './firebase-config.js';
+import { getMessaging, getToken, onMessage, isSupported } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js';
+import { firebaseConfig, VAPID_KEY } from './firebase-config.js';
 import { SEED_TEAM, SEED_PROJECTS, SEED_ITEMS, SEED_SUBS } from './seed.js';
 
 const fb = initializeApp(firebaseConfig);
 const auth = getAuth(fb);
 const db = getFirestore(fb);
+
+/* ---------- התראות לטלפון ---------- */
+const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const pushState = () => {
+  if (!('Notification' in window) || !('serviceWorker' in navigator)) return isIOS && !standalone ? 'ios-home' : 'unsupported';
+  if (Notification.permission === 'denied') return 'denied';
+  if (Notification.permission === 'granted' && localStorage.getItem('pushToken')) return 'on';
+  return 'off';
+};
+async function enablePush() {
+  if (!VAPID_KEY) { toast('ההתראות עוד לא הוגדרו במערכת'); return; }
+  if (!(await isSupported())) { toast(isIOS ? 'באייפון: קודם "הוסף למסך הבית", ופותחים את המערכת משם' : 'הדפדפן הזה לא תומך בהתראות'); return; }
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') { toast('ההתראות לא אושרו. אפשר לאשר בהגדרות הדפדפן'); render(); return; }
+  const reg = await navigator.serviceWorker.register('firebase-messaging-sw.js');
+  const token = await getToken(getMessaging(fb), { vapidKey: VAPID_KEY, serviceWorkerRegistration: reg });
+  await setDoc(doc(db, 'tokens', token), { name: me(), email: S.user.email, at: serverTimestamp(), device: navigator.userAgent.slice(0, 120) });
+  localStorage.setItem('pushToken', token);
+  toast('ההתראות הופעלו בטלפון הזה 🔔'); render();
+}
+async function refreshPushName() {
+  const t = localStorage.getItem('pushToken');
+  if (t && Notification.permission === 'granted') await setDoc(doc(db, 'tokens', t), { name: me(), email: S.user.email }, { merge: true }).catch(() => {});
+}
+isSupported().then(ok => { if (ok) onMessage(getMessaging(fb), m => toast(((m.notification || {}).title || '') + ' · ' + ((m.notification || {}).body || ''))); }).catch(() => {});
 
 /* ---------- constants ---------- */
 const STATUS = { open: 'פתוח', progress: 'בתהליך', stuck: 'תקוע', done: 'בוצע' };
@@ -205,7 +232,11 @@ function viewMine() {
   const done = mine.filter(it => it.status === 'done' && ts(it.doneAt) > weekAgo);
   const subs = S.subs.filter(s => isMine(s.owners) && (s.stage ?? -1) < 4);
   const week = open.filter(it => { const d = daysLeft(it); return d !== null && d >= 0 && d <= 7; });
-  return `
+  const ps = pushState();
+  const banner = ps === 'on' || ps === 'unsupported' ? '' : `<div class="pushb">
+    <span>🔔 ${ps === 'denied' ? 'ההתראות חסומות בטלפון הזה. אפשר לאשר אותן בהגדרות הדפדפן.' : ps === 'ios-home' ? 'כדי לקבל התראות באייפון: לחצו על כפתור השיתוף ב-Safari, "הוסף למסך הבית", ופתחו את המערכת מהאייקון.' : 'רוצה לקבל תזכורות ועדכונים לטלפון הזה?'}</span>
+    ${ps === 'off' ? '<button class="btn sm" data-act="enablePush">הפעל התראות</button>' : ''}</div>`;
+  return `${banner}
   <h1>שלום, ${esc(me())}</h1>
   <div class="kpis">
     <div class="kpi"><b>${open.length}</b><span>משימות פתוחות</span></div>
@@ -489,6 +520,7 @@ async function handle(act, el) {
     case 'tab': S.tab = v; localStorage.setItem('tab', v); render(); window.scrollTo(0, 0); break;
     case 'fPerson': S.fPerson = v; render(); break;
     case 'fDone': S.fShowDone = !S.fShowDone; render(); break;
+    case 'enablePush': el.disabled = true; await enablePush(); break;
     case 'view': S.view = v; localStorage.setItem('view', v); render(); break;
     case 'fStatus': S.fStatus = v; render(); break;
     case 'clearRemind': document.getElementById('f-rd').value = ''; el.remove(); break;
@@ -596,7 +628,7 @@ async function handle(act, el) {
       const hit = team.find(t => t.name === v);
       if (hit) hit.email = email; else team.push({ name: S.user.displayName || email, email });
       await setDoc(doc(db, 'settings', 'main'), { team }, { merge: true });
-      closeSheet(); toast('שלום ' + (hit ? hit.name : (S.user.displayName || ''))); break;
+      closeSheet(); toast('שלום ' + (hit ? hit.name : (S.user.displayName || ''))); setTimeout(refreshPushName, 500); break;
     }
     case 'print': window.print(); break;
     case 'closeMeeting':
