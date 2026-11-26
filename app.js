@@ -2,7 +2,7 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/fireba
 import { getAuth, signInWithEmailAndPassword, sendPasswordResetEmail, signOut, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   getFirestore, collection, doc, onSnapshot, addDoc, setDoc, updateDoc, deleteDoc,
-  serverTimestamp, writeBatch, query, orderBy, limit
+  serverTimestamp, writeBatch, query, orderBy, limit, where, getDocs
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 import { getMessaging, getToken, onMessage, isSupported } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js';
 import { firebaseConfig, VAPID_KEY } from './firebase-config.js';
@@ -46,11 +46,12 @@ const stageName = s => (s < 0 ? 'טרם התחיל' : STAGES[s]);
 
 /* ---------- state ---------- */
 const S = {
-  user: null, team: [], meta: {}, projects: [], items: [], subs: [], updates: [],
+  user: null, team: [], meta: {}, projects: [], items: [], subs: [], updates: [], meetings: [], tokens: [],
+  itemsPub: [], itemsMine: [], mEdit: null, mDirty: false, autoSum: false,
   tab: localStorage.getItem('tab') || 'mine', view: localStorage.getItem('view') || '',
   fPerson: 'all', fShowDone: false, fSubOpen: true,
   meetingDate: new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10),
-  loaded: { projects: false, items: false, subs: false, settings: false },
+  loaded: { projects: false, items: false, itemsMine: false, subs: false, settings: false },
   denied: false, unsub: []
 };
 const lastSeen = () => Number(localStorage.getItem('seen') || 0);
@@ -93,9 +94,26 @@ function pill(it) {
 async function logUpdate(text, ref) {
   await addDoc(collection(db, 'updates'), { text, by: me(), at: serverTimestamp(), ref: ref || null });
 }
-function waLink(text) { return 'https://wa.me/?text=' + encodeURIComponent(text); }
+function waLink(text, phone) { return 'https://wa.me/' + (phone || '') + '?text=' + encodeURIComponent(text); }
+// מספר ישראלי בפורמט של וואטסאפ: 0521234567 ← 972521234567
+const waPhone = p => { const d = String(p || '').replace(/\D/g, ''); return !d ? '' : d.startsWith('972') ? d : d.startsWith('0') ? '972' + d.slice(1) : d; };
+const waTargets = owners => S.team.filter(t => t.phone && t.name !== me() && ((owners || []).includes(t.name) || (owners || []).includes('כולם')));
+const waButtons = (owners, act) => waTargets(owners).slice(0, 3).map(t => `<button class="btn wa" data-act="${act}" data-v="wa:${esc(t.name)}">שמור ושלח ל${esc(t.name)} בוואטסאפ</button>`).join('');
 
 /* ---------- auth & data ---------- */
+// פעם אחת: לסמן את כל המשימות הישנות כ"כלליות", כדי שיופיעו לכולם גם אחרי החוקים החדשים
+async function migratePrivate() {
+  try {
+    const all = await getDocs(collection(db, 'items'));
+    const old = all.docs.filter(d => d.data().private === undefined);
+    for (let i = 0; i < old.length; i += 400) {
+      const b = writeBatch(db);
+      old.slice(i, i + 400).forEach(d => b.update(d.ref, { private: false }));
+      await b.commit();
+    }
+    if (old.length) console.log('migrated', old.length, 'items');
+  } catch (e) { /* אחרי החוקים החדשים הקריאה הזו חסומה, וזה תקין */ }
+}
 onAuthStateChanged(auth, user => {
   S.unsub.forEach(u => u()); S.unsub = [];
   S.user = user; S.denied = false;
@@ -106,10 +124,27 @@ onAuthStateChanged(auth, user => {
     S.projects = q.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.order ?? 99) - (b.order ?? 99));
     S.loaded.projects = true; render();
   }, onErr));
-  S.unsub.push(onSnapshot(collection(db, 'items'), q => {
-    S.items = q.docs.map(d => ({ id: d.id, ...d.data() }));
-    S.loaded.items = true; render();
+  const mergeItems = () => {
+    const map = new Map();
+    [...S.itemsPub, ...S.itemsMine].forEach(i => map.set(i.id, i));
+    S.items = [...map.values()];
+  };
+  S.unsub.push(onSnapshot(query(collection(db, 'items'), where('private', '==', false)), q => {
+    S.itemsPub = q.docs.map(d => ({ id: d.id, ...d.data() }));
+    mergeItems(); S.loaded.items = true; render();
   }, onErr));
+  S.unsub.push(onSnapshot(query(collection(db, 'items'), where('ownerUid', '==', user.uid)), q => {
+    S.itemsMine = q.docs.map(d => ({ id: d.id, ...d.data() }));
+    mergeItems(); S.loaded.itemsMine = true; render();
+  }, onErr));
+  S.unsub.push(onSnapshot(collection(db, 'meetings'), q => {
+    S.meetings = q.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (b.date || '').localeCompare(a.date || '') || ts(b.updatedAt) - ts(a.updatedAt));
+    render();
+  }, e => console.warn('meetings', e.code)));
+  S.unsub.push(onSnapshot(collection(db, 'tokens'), q => {
+    S.tokens = q.docs.map(d => ({ id: d.id, ...d.data() }));
+  }, e => console.warn('tokens', e.code)));
+  migratePrivate();
   S.unsub.push(onSnapshot(collection(db, 'subs'), q => {
     S.subs = q.docs.map(d => ({ id: d.id, ...d.data() }));
     S.loaded.subs = true; render();
@@ -128,7 +163,7 @@ onAuthStateChanged(auth, user => {
 function renderLogin(err, info) {
   const email = (document.getElementById('l-email') || {}).value || '';
   $app.innerHTML = `<form class="login" id="login-form">
-    <div style="font-size:22px;font-weight:800">שלום בוקטוס</div>
+    <div style="font-size:22px;font-weight:800">חברת הנדל"ן בוקטוס</div>
     <div class="sub" style="margin:0">ניהול פרויקטים, משימות וקבלני משנה</div>
     <label style="text-align:right">מייל<input type="email" id="l-email" autocomplete="username" dir="ltr" required value="${esc(email)}"></label>
     <label style="text-align:right">סיסמה<input type="password" id="l-pass" autocomplete="current-password" dir="ltr" required></label>
@@ -149,7 +184,8 @@ const AUTH_ERR = {
 const authMsg = e => AUTH_ERR[e.code] || ('שגיאה: ' + (e.code || e.message));
 
 /* ---------- main render ---------- */
-function render() {
+function render(force) {
+  if (!force && S.tab === 'meeting' && S.mEdit && document.getElementById('mtable')) return;
   if (!S.user) return renderLogin();
   if (S.denied) {
     $app.innerHTML = `<div class="login"><div style="font-weight:800;font-size:18px">אין הרשאה</div>
@@ -161,7 +197,7 @@ function render() {
   const mapped = S.team.some(t => (t.email || '').toLowerCase() === (S.user.email || '').toLowerCase());
   if (S.team.length && !mapped && !S.askedWho && $sheet.hidden) { S.askedWho = true; setTimeout(sheetWho, 0); }
   const newCount = S.updates.filter(u => ts(u.at) > lastSeen() && u.by !== me()).length;
-  const tabs = [['mine', 'המשימות שלי'], ['all', 'כל המשימות'], ['projects', 'פרויקטים'], ['subs', 'קבלני משנה'], ['feed', 'עדכונים'], ['meeting', 'פגישה שבועית']];
+  const tabs = [['mine', 'המשימות שלי'], ['all', 'כל המשימות'], ['projects', 'פרויקטים'], ['subs', 'קבלני משנה'], ['feed', 'עדכונים'], ['meeting', 'פגישות']];
   const body = S.projects.length === 0 ? viewEmpty()
     : S.tab === 'all' ? viewAll()
     : S.tab === 'projects' ? viewProjects()
@@ -172,7 +208,7 @@ function render() {
   $app.innerHTML = `
   <header class="top">
     <div class="in">
-      <div class="brand">שלום בוקטוס <span>· ניהול פרויקטים</span></div>
+      <div class="brand">בוקטוס <span>· ניהול פרויקטים</span></div>
       <div class="who"><span>${esc(me())}</span><button data-act="team">צוות</button><button data-act="logout">יציאה</button></div>
     </div>
     <nav class="tabs" aria-label="ניווט">
@@ -181,6 +217,8 @@ function render() {
   </header>
   <main>${body}</main>
   ${S.projects.length && S.tab !== 'meeting' ? `<button class="btn fab noprint" data-act="newItem">+ משימה חדשה</button>` : ''}`;
+  if (S.tab === 'meeting' && S.mEdit) autosizeAll();
+  if (!S.pushNameSynced && pushState() === 'on' && S.team.length) { S.pushNameSynced = true; refreshPushName(); }
 }
 
 function viewEmpty() {
@@ -216,7 +254,8 @@ const lastBy = it => (it.updatedBy ? `${esc(it.updatedBy)} · ${fmtAgo(ts(it.upd
 function taskCard(it, showProject = true) {
   return `<button class="task ${isLate(it) ? 'late' : ''}" data-act="openItem" data-id="${it.id}">
     <div class="h"><span>${showProject ? `<span class="proj">${esc(projName(it.projectId))}</span>` : ''}${it.urgent && it.status !== 'done' ? '<span class="urg">דחוף</span>' : ''}</span>${pill(it)}</div>
-    <div class="t">${esc(it.text)}</div>
+    <div class="t">${it.private ? '🔒 ' : ''}${esc(it.text)}</div>
+    ${it.status === 'stuck' && it.stuckReason ? `<div class="why">סיבה: ${esc(it.stuckReason)}</div>` : ''}
     <div class="m"><span>אחריות: ${esc((it.owners || []).join(', ') || '—')}</span>${dueChip(it)}</div>
     ${it.note ? `<div class="note">${esc(it.note)}</div>` : ''}
     <div class="m"><span>${bell(it)}</span><span>${lastBy(it) ? 'עודכן: ' + lastBy(it) : ''}</span></div>
@@ -226,7 +265,7 @@ const dueKey = it => (it.due ? daysLeft(it) : 99999);
 const taskSort = (a, b) => (a.status === 'done') - (b.status === 'done') || (b.urgent ? 1 : 0) - (a.urgent ? 1 : 0) || dueKey(a) - dueKey(b);
 
 function viewMine() {
-  const mine = S.items.filter(it => it.kind === 'task' && isMine(it.owners));
+  const mine = S.items.filter(it => it.kind === 'task' && (it.private ? it.ownerUid === S.user.uid : isMine(it.owners)));
   const open = mine.filter(it => it.status !== 'done').sort(taskSort);
   const weekAgo = Date.now() - 7 * 864e5;
   const done = mine.filter(it => it.status === 'done' && ts(it.doneAt) > weekAgo);
@@ -258,7 +297,7 @@ function viewMine() {
 function viewAll() {
   const people = ['all', ...S.team.map(t => t.name)];
   const st = S.fStatus || 'active';
-  let list = S.items.filter(it => it.kind === 'task')
+  let list = pubItems().filter(it => it.kind === 'task')
     .filter(it => S.fPerson === 'all' || (it.owners || []).includes(S.fPerson) || (it.owners || []).includes('כולם'))
     .filter(it => !S.fProject || it.projectId === S.fProject)
     .filter(it => st === 'all' ? true : st === 'active' ? it.status !== 'done' : st === 'late' ? isLate(it) : it.status === st)
@@ -279,14 +318,14 @@ function viewAll() {
     : `<div class="tbl"><table>
       <thead><tr><th>משימה</th><th>פרויקט</th><th>אחראי</th><th>סטטוס</th><th>יעד</th><th>עוד כמה ימים</th><th>עודכן</th></tr></thead>
       <tbody>${list.map(it => `<tr class="click ${isLate(it) ? 'late' : ''}" data-act="openItem" data-id="${it.id}">
-        <td style="min-width:240px">${it.urgent && it.status !== 'done' ? '<span class="urg">דחוף</span> ' : ''}${esc(it.text)}${it.note ? `<div style="font-size:12px;color:#4B5563">${esc(it.note)}</div>` : ''}${bell(it) ? `<div>${bell(it)}</div>` : ''}</td>
+        <td style="min-width:240px">${it.urgent && it.status !== 'done' ? '<span class="urg">דחוף</span> ' : ''}${esc(it.text)}${it.note ? `<div style="font-size:12px;color:#4B5563">${esc(it.note)}</div>` : ''}${it.status === 'stuck' && it.stuckReason ? `<div class="why">סיבה: ${esc(it.stuckReason)}</div>` : ''}${bell(it) ? `<div>${bell(it)}</div>` : ''}</td>
         <td>${esc(projName(it.projectId))}</td><td>${esc((it.owners || []).join(', ') || '—')}</td><td>${pill(it)}</td>
         <td>${fmtD(it.due)}</td><td>${dueChip(it)}</td><td style="font-size:12px;color:#4B5563">${lastBy(it)}</td></tr>`).join('')}</tbody>
     </table></div>`}`;
 }
 
 function projStats(pid) {
-  const t = S.items.filter(it => it.projectId === pid && it.kind === 'task');
+  const t = pubItems().filter(it => it.projectId === pid && it.kind === 'task');
   const done = t.filter(it => it.status === 'done').length;
   return { total: t.length, done, open: t.length - done, late: t.filter(isLate).length, stuck: t.filter(it => it.status === 'stuck').length, pct: t.length ? Math.round(done / t.length * 100) : 0 };
 }
@@ -309,7 +348,7 @@ function viewProjects() {
     <button class="chip" data-act="fDone" aria-pressed="${S.fShowDone}">הצג גם מה שבוצע</button>
   </div>
   <div class="pgrid">${act.map(p => {
-    const its = S.items.filter(it => it.projectId === p.id && match(it))
+    const its = pubItems().filter(it => it.projectId === p.id && match(it))
       .sort((a, b) => ({ task: 0, ongoing: 1, info: 2 }[a.kind] - { task: 0, ongoing: 1, info: 2 }[b.kind]) || taskSort(a, b));
     const openSubs = S.subs.filter(s => s.projectId === p.id && (s.stage ?? -1) < 4).length;
     const s = projStats(p.id);
@@ -329,7 +368,7 @@ function viewProjects() {
       <div class="barl">${s.total ? `${s.done} מתוך ${s.total} משימות בוצעו · ${s.pct}%` : 'אין משימות עדיין'}</div>
       ${its.map(it => `<button class="prow" data-act="openItem" data-id="${it.id}">
         <div><div class="t">${it.urgent && it.status !== 'done' ? '<span class="urg">דחוף</span> ' : ''}${esc(it.text)}</div>
-        <div class="m">${esc((it.owners || []).join(', ') || '')} ${dueChip(it)} ${bell(it)}${it.note ? ` · ${esc(it.note)}` : ''}</div></div>
+        <div class="m">${esc((it.owners || []).join(', ') || '')} ${dueChip(it)} ${bell(it)}${it.note ? ` · ${esc(it.note)}` : ''}</div>${it.status === 'stuck' && it.stuckReason ? `<div class="why">סיבה: ${esc(it.stuckReason)}</div>` : ''}</div>
         ${pill(it)}</button>`).join('') || '<div class="empty">אין פריטים</div>'}
     </section>`;
   }).join('')}</div>`;
@@ -368,15 +407,158 @@ function viewFeed() {
     <div>${esc(u.text)}</div><div class="w">${esc(u.by)} · ${fmtAgo(ts(u.at))}</div></div>`).join('') || '<div class="empty card">עוד אין עדכונים</div>'}</div>`;
 }
 
+/* ---------- פגישות: יצירה, עריכה והיסטוריה ---------- */
+const COMPANY = () => S.meta.companyName || 'חברת הנדל"ן בוקטוס';
+const M_STATUS = ['', 'פתוח', 'בתהליך', 'תקוע', 'בוצע', 'לידיעה', 'שוטף', 'דחוף'];
+const emptyRow = () => ({ topic: '', owner: '', due1: '', due2: '', status: '' });
+const fmtD0 = d => (d ? fmtD(d) : '');
+const fmtFull = d => (d ? d.split('-').reverse().join('/') : '');
+const pubItems = () => S.items.filter(i => !i.private);
+
+function newSections(mode) {
+  const act = S.projects.filter(p => !p.archived);
+  if (mode === 'copy' && S.meetings[0]) {
+    const prev = JSON.parse(JSON.stringify(S.meetings[0].sections || []));
+    const keep = r => r.status !== 'בוצע' && (r.topic || '').trim();
+    const secs = prev.map(s => ({ ...s, rows: (s.rows || []).filter(keep), subs: (s.subs || []).filter(keep) }));
+    act.forEach(p => { if (!secs.some(s => s.projectId === p.id || s.name === p.name)) secs.push({ name: p.name, projectId: p.id, rows: [emptyRow()], subs: [] }); });
+    secs.forEach(s => { if (!s.rows.length) s.rows.push(emptyRow()); });
+    return secs;
+  }
+  if (mode === 'system') {
+    return act.map(p => ({
+      name: p.name, projectId: p.id,
+      rows: pubItems().filter(i => i.projectId === p.id && i.status !== 'done').map(i => ({
+        topic: i.text + (i.note ? ' – ' + i.note : '') + (i.status === 'stuck' && i.stuckReason ? ` (תקוע: ${i.stuckReason})` : ''),
+        owner: (i.owners || []).join(', '),
+        due1: i.kind === 'ongoing' ? 'שוטף' : i.kind === 'info' ? 'לידיעה' : fmtD0(i.dueOrig),
+        due2: i.kind === 'task' && i.due && i.due !== i.dueOrig ? fmtD0(i.due) : '',
+        status: i.kind === 'task' ? (i.urgent ? 'דחוף' : STATUS[i.status || 'open']) : KIND[i.kind]
+      })).concat([emptyRow()]),
+      subs: S.subs.filter(s => s.projectId === p.id && (s.stage ?? -1) < 4).map(s => ({
+        topic: s.trade + (s.contractors ? ' – ' + s.contractors : '') + (s.note ? ' – ' + s.note : '') + (s.price ? ` (${s.price})` : ''),
+        owner: (s.owners || []).join(', '), due1: '', due2: '', status: stageName(s.stage ?? -1)
+      }))
+    }));
+  }
+  return act.map(p => ({ name: p.name, projectId: p.id, rows: [emptyRow(), emptyRow()], subs: [emptyRow()] }));
+}
+
 function viewMeeting() {
+  if (S.mEdit) return viewMeetingEdit();
+  if (S.autoSum) return viewAutoSummary();
+  return `
+  <div class="row" style="margin-bottom:12px"><h1 class="sp">פגישות</h1>
+    <button class="btn ghost" data-act="autoSum">תמונת מצב מהמשימות</button>
+    <button class="btn" data-act="newMeeting">+ פגישה חדשה</button></div>
+  <p class="sub">כל פגישה נשמרת כאן, באותו מבנה של סיכום הפגישה שלכם. לוחצים על פגישה כדי לראות או לערוך אותה.</p>
+  <div class="list">${S.meetings.map(m => {
+    const count = (m.sections || []).reduce((a, s) => a + [...(s.rows || []), ...(s.subs || [])].filter(r => (r.topic || '').trim()).length, 0);
+    return `<button class="task" data-act="openMeeting" data-id="${m.id}">
+      <div class="h"><b style="font-size:16px">פגישה שבועית ${fmtFull(m.date)}</b><span class="pill open">${count} נושאים</span></div>
+      <div class="m"><span>נוכחים: ${esc(m.attendees || '—')}</span><span>${m.updatedBy ? `עודכן: ${esc(m.updatedBy)} · ${fmtAgo(ts(m.updatedAt))}` : ''}</span></div>
+    </button>`;
+  }).join('') || '<div class="empty card">עוד אין פגישות שמורות. לחצו "פגישה חדשה" כדי להתחיל.</div>'}</div>`;
+}
+
+function renumber() {
+  let n = 0;
+  document.querySelectorAll('#mtable tr[data-row]').forEach(tr => {
+    const t = tr.querySelector('textarea'); const c = tr.querySelector('td.num');
+    if (c) c.textContent = t && t.value.trim() ? ++n : '';
+  });
+}
+function mRow(i, k, j, r, n) {
+  const f = (name, w) => `<input type="text" data-m="cell" data-s="${i}" data-k="${k}" data-r="${j}" data-f="${name}" value="${esc(r[name] || '')}" aria-label="${w}">`;
+  return `<tr class="${(r.topic || '').trim() ? '' : 'emptyrow'}" data-row="${i}-${k}-${j}">
+    <td class="num">${(r.topic || '').trim() ? n : ''}</td>
+    <td><textarea rows="1" data-m="cell" data-s="${i}" data-k="${k}" data-r="${j}" data-f="topic" aria-label="נושא">${esc(r.topic || '')}</textarea></td>
+    <td>${f('owner', 'אחריות')}</td><td>${f('due1', 'יעד מקורי')}</td><td>${f('due2', 'יעד עדכני')}</td>
+    <td><select data-m="cell" data-s="${i}" data-k="${k}" data-r="${j}" data-f="status" aria-label="סטטוס">${(M_STATUS.includes(r.status || '') ? M_STATUS : [...M_STATUS, r.status]).map(s => `<option ${s === (r.status || '') ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select></td>
+    <td class="noprint"><button class="rx" data-act="mDelRow" data-v="${i}-${k}-${j}" aria-label="מחיקת שורה">×</button></td>
+  </tr>`;
+}
+
+function viewMeetingEdit() {
+  const m = S.mEdit; let n = 0;
+  const body = (m.sections || []).map((s, i) => `
+    <tr class="sec"><td colspan="6"><input type="text" class="secname" data-m="sec" data-s="${i}" value="${esc(s.name)}" aria-label="שם הסעיף"></td>
+      <td class="noprint"><button class="rx" data-act="mDelSec" data-v="${i}" aria-label="מחיקת סעיף">×</button></td></tr>
+    ${(s.rows || []).map((r, j) => mRow(i, 'rows', j, r, (r.topic || '').trim() ? ++n : 0)).join('')}
+    <tr class="noprint addr"><td></td><td colspan="6"><button class="btn ghost sm" data-act="mAddRow" data-v="${i}-rows">+ שורה</button>
+      ${(s.subs || []).length ? '' : `<button class="btn ghost sm" data-act="mAddRow" data-v="${i}-subs">+ קבלני משנה</button>`}</td></tr>
+    ${(s.subs || []).length ? `<tr class="sub ${s.subs.some(r => (r.topic || '').trim()) ? '' : 'emptyrow'}"><td></td><td colspan="5">קבלני משנה</td><td class="noprint"></td></tr>
+      ${s.subs.map((r, j) => mRow(i, 'subs', j, r, (r.topic || '').trim() ? ++n : 0)).join('')}
+      <tr class="noprint addr"><td></td><td colspan="6"><button class="btn ghost sm" data-act="mAddRow" data-v="${i}-subs">+ שורת קבלן</button></td></tr>` : ''}
+  `).join('');
+  return `
+  <div class="row noprint" style="margin-bottom:12px">
+    <button class="btn ghost sm" data-act="mBack">→ כל הפגישות</button>
+    <span class="sp"></span><span id="mstate" class="mstate">${S.mDirty ? 'שומר…' : 'נשמר ✓'}</span>
+    <label style="flex-direction:row;align-items:center;gap:8px">תאריך <input type="date" data-m="date" value="${esc(m.date)}" style="width:auto"></label>
+    <button class="btn" data-act="print">הדפסה / PDF</button>
+    <button class="btn danger sm" data-act="mDelete">מחיקת הפגישה</button>
+  </div>
+  <div class="mtitle">פגישה שבועית – ${esc(COMPANY())} ${fmtFull(m.date)}</div>
+  <div class="matt">נוכחים: <input type="text" data-m="att" value="${esc(m.attendees || '')}" aria-label="נוכחים"></div>
+  <div style="overflow-x:auto"><table class="mt edit" id="mtable">
+    <thead><tr><th style="width:36px">מס</th><th>נושא</th><th style="width:120px">אחריות</th><th style="width:90px">יעד מקורי</th><th style="width:90px">יעד עדכני</th><th style="width:118px">סטטוס</th><th class="noprint" style="width:34px"></th></tr></thead>
+    <tbody>${body}</tbody>
+  </table></div>
+  <div class="row noprint" style="margin-top:10px"><button class="btn ghost sm" data-act="mAddSec">+ סעיף חדש (פרויקט או נושא)</button></div>
+  <p class="sub noprint" style="margin-top:12px">השינויים נשמרים לבד תוך שנייה. שורות ריקות לא מודפסות.</p>`;
+}
+
+function autosizeAll() { document.querySelectorAll('#mtable textarea').forEach(autosize); }
+function autosize(t) { t.style.height = 'auto'; t.style.height = t.scrollHeight + 'px'; }
+let mTimer;
+function setMState(t) { const e = document.getElementById('mstate'); if (e) e.textContent = t; }
+function mSchedule() { S.mDirty = true; setMState('שומר…'); clearTimeout(mTimer); mTimer = setTimeout(() => mSave().catch(e => { console.error(e); setMState('השמירה נכשלה'); }), 1000); }
+async function mSave() {
+  const m = S.mEdit; clearTimeout(mTimer);
+  if (!m || !S.mDirty) return;
+  S.mDirty = false;
+  await setDoc(doc(db, 'meetings', m.id), { date: m.date, attendees: m.attendees || '', sections: m.sections, createdBy: m.createdBy || me(), updatedAt: serverTimestamp(), updatedBy: me() }, { merge: true });
+  setMState('נשמר ✓');
+}
+function onMeetingInput(t) {
+  const m = S.mEdit; if (!m) return;
+  const kind = t.dataset.m;
+  if (kind === 'date') { m.date = t.value; const h = document.querySelector('.mtitle'); if (h) h.textContent = `פגישה שבועית – ${COMPANY()} ${fmtFull(m.date)}`; }
+  else if (kind === 'att') m.attendees = t.value;
+  else if (kind === 'sec') m.sections[+t.dataset.s].name = t.value;
+  else if (kind === 'cell') {
+    const row = m.sections[+t.dataset.s][t.dataset.k][+t.dataset.r];
+    row[t.dataset.f] = t.value;
+    if (t.tagName === 'TEXTAREA') autosize(t);
+    if (t.dataset.f === 'topic') { t.closest('tr').classList.toggle('emptyrow', !t.value.trim()); renumber(); }
+  }
+  mSchedule();
+}
+
+function sheetNewMeeting() {
+  const prev = S.meetings[0];
+  openSheet(`${head('פגישה חדשה')}
+    <label>תאריך<input type="date" id="nm-date" value="${today()}"></label>
+    <label>נוכחים<input type="text" id="nm-att" value="${esc(prev ? prev.attendees || '' : S.team.map(t => t.name).join(', '))}"></label>
+    <div style="font-size:13px;color:#4B5563">איך להתחיל?</div>
+    <div class="checks" style="flex-direction:column;align-items:stretch">
+      <label><input type="radio" name="nm-mode" value="empty" checked> טבלה ריקה, באותו מבנה (סעיף לכל פרויקט)</label>
+      ${prev ? `<label><input type="radio" name="nm-mode" value="copy"> להעתיק את הנושאים הפתוחים מהפגישה של ${fmtFull(prev.date)}</label>` : ''}
+      <label><input type="radio" name="nm-mode" value="system"> למלא מהמשימות הפתוחות במערכת</label>
+    </div>
+    <button class="btn" data-act="createMeeting">יצירת הפגישה</button>`);
+}
+
+function viewAutoSummary() {
   const since = ts(S.meta.lastMeetingAt);
   const show = it => it.status !== 'done' || ts(it.doneAt) > since;
   let n = 0;
-  const rowsFor = list => list.map(it => `<tr><td>${++n}</td><td>${it.urgent && it.status !== 'done' ? '<b>דחוף! </b>' : ''}${esc(it.text)}${it.note ? `<br><span style="color:#475569">${esc(it.note)}</span>` : ''}</td>
+  const rowsFor = list => list.map(it => `<tr><td>${++n}</td><td>${it.urgent && it.status !== 'done' ? '<b>דחוף! </b>' : ''}${esc(it.text)}${it.note ? `<br><span style="color:#475569">${esc(it.note)}</span>` : ''}${it.status === 'stuck' && it.stuckReason ? `<br><span style="color:#9A3412">סיבה: ${esc(it.stuckReason)}</span>` : ''}</td>
     <td>${esc((it.owners || []).join(', ') || (it.kind === 'info' ? 'לידיעה' : ''))}</td><td>${it.kind === 'ongoing' ? 'שוטף' : fmtD(it.dueOrig || '')}</td>
     <td>${it.kind === 'task' && it.due !== it.dueOrig ? fmtD(it.due) : ''}</td><td>${it.kind === 'task' ? STATUS[it.status || 'open'] : KIND[it.kind]}</td></tr>`).join('');
   const sections = S.projects.filter(p => !p.archived).map(p => {
-    const its = S.items.filter(it => it.projectId === p.id && show(it));
+    const its = pubItems().filter(it => it.projectId === p.id && show(it));
     const subs = S.subs.filter(s => s.projectId === p.id && ((s.stage ?? -1) < 4 || ts(s.updatedAt) > since));
     if (!its.length && !subs.length) return '';
     return `<tr class="sec"><td colspan="6">${esc(p.name)}</td></tr>${rowsFor(its)}
@@ -385,14 +567,14 @@ function viewMeeting() {
   const [y, m, d] = S.meetingDate.split('-');
   return `
   <div class="row noprint" style="margin-bottom:12px">
-    <h1 class="sp">פגישה שבועית</h1>
-    <label style="flex-direction:row;align-items:center;gap:8px">תאריך <input type="date" value="${S.meetingDate}" data-act="meetingDate" style="width:auto"></label>
+    <button class="btn ghost sm" data-act="mBack">→ כל הפגישות</button>
+    <h1 class="sp">תמונת מצב מהמשימות</h1>
     <button class="btn" data-act="print">הדפסה / PDF</button>
     <button class="btn ghost" data-act="closeMeeting">סיימנו פגישה</button>
   </div>
-  <p class="sub noprint">מוצגות כל המשימות הפתוחות, ומה שבוצע מאז הפגישה הקודמת${since ? ` (${new Date(since).toLocaleDateString('he-IL')})` : ''}. "סיימנו פגישה" מוריד מהטבלה את מה שכבר בוצע.</p>
-  <div style="text-align:center;font-weight:800;font-size:18px;margin:6px 0">פגישה שבועית – שלום בוקטוס בניה ויזמות בע"מ ${d}/${m}/${y}</div>
-  <div style="font-size:13px;margin-bottom:6px">נוכחים: ${esc(S.team.map(t => t.name).join(', '))}</div>
+  <p class="sub noprint">נבנה אוטומטית מהמשימות הפתוחות במערכת, ומה שבוצע מאז הפעם האחרונה שסימנתם "סיימנו פגישה"${since ? ` (${new Date(since).toLocaleDateString('he-IL')})` : ''}.</p>
+  <div class="mtitle">פגישה שבועית – ${esc(COMPANY())} ${d}/${m}/${y}</div>
+  <div class="matt">נוכחים: ${esc(S.team.map(t => t.name).join(', '))}</div>
   <div style="overflow-x:auto"><table class="mt">
     <thead><tr><th style="width:36px">מס</th><th>נושא</th><th style="width:110px">אחריות</th><th style="width:80px">יעד מקורי</th><th style="width:80px">יעד עדכני</th><th style="width:80px">סטטוס</th></tr></thead>
     <tbody>${sections}</tbody>
@@ -414,9 +596,10 @@ function sheetItem(id) {
     ${it.remindAt ? `<div style="font-size:13px">🔔 תזכורת ${esc(fmtRemind(it.remindAt))} ל${esc((it.remindTo || []).join(', '))}${it.reminderSent ? ' (נשלחה)' : ''}</div>` : ''}
     ${it.kind === 'task' ? `<div style="font-size:13px;color:#4B5563">מה המצב?</div>
     <div class="seg">${Object.entries(STATUS).map(([k, l]) => `<button class="${k}" data-act="st" data-v="${k}" aria-pressed="${draft.status === k}">${l}</button>`).join('')}</div>
+    <label id="why-box" ${draft.status === 'stuck' ? '' : 'hidden'} class="whyl">למה זה תקוע? (חובה)<textarea id="f-why" placeholder="למשל: מחכים לאישור יועץ בטיחות">${esc(it.stuckReason || '')}</textarea></label>
     <label>יעד עדכני<input type="date" id="f-due" value="${esc(it.due || '')}"></label>` : ''}
     <label>הערה, מחיר או פרטים<textarea id="f-note" placeholder="למשל: נסגר ב-12,000 ₪, מתחיל ביום ראשון">${esc(it.note || '')}</textarea></label>
-    <div class="row"><button class="btn sp" data-act="saveItem">שמור עדכון</button><button class="btn wa" data-act="saveItem" data-v="wa">שמור ושלח בוואטסאפ</button></div>
+    <div class="row"><button class="btn sp" data-act="saveItem">שמור עדכון</button>${it.private ? '' : waButtons(it.owners, 'saveItem')}</div>
     <div class="row"><button class="btn ghost sm" data-act="editItem" data-id="${id}">עריכה מלאה</button><button class="btn ghost sm" data-act="editItem" data-id="${id}">🔔 הגדר תזכורת</button></div>
     ${it.updatedBy ? `<div class="hist">עודכן לאחרונה ע״י ${esc(it.updatedBy)} ${fmtAgo(ts(it.updatedAt))}</div>` : ''}`);
 }
@@ -429,7 +612,8 @@ function sheetItemForm(id, projectId) {
       <label>פרויקט<select id="f-proj">${S.projects.map(p => `<option value="${p.id}" ${p.id === it.projectId ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
       <label>סוג<select id="f-kind">${Object.entries(KIND).map(([k, l]) => `<option value="${k}" ${k === it.kind ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     </div>
-    <div style="font-size:13px;color:#4B5563">אחריות</div>${ownersChecks(it.owners)}
+    <label class="privl"><input type="checkbox" id="f-priv" ${it.private ? 'checked' : ''} ${id && it.ownerUid && it.ownerUid !== S.user.uid ? 'disabled' : ''}> 🔒 משימה פרטית: רק אני רואה אותה, ורק ב"המשימות שלי"</label>
+    <div id="owners-box" ${it.private ? 'hidden' : ''}><div style="font-size:13px;color:#4B5563">אחריות</div>${ownersChecks(it.owners)}</div>
     <div class="two">
       <label>תאריך יעד<input type="date" id="f-due2" value="${esc(it.due || '')}"></label>
       <label style="flex-direction:row;align-items:center;gap:8px;margin-top:18px"><input type="checkbox" id="f-urg" ${it.urgent ? 'checked' : ''}> דחוף</label>
@@ -438,8 +622,8 @@ function sheetItemForm(id, projectId) {
     <fieldset class="rem"><legend>🔔 תזכורת לטלפון</legend>
       <div class="two"><label>תאריך<input type="date" id="f-rd" value="${esc((it.remindAt || '').split('T')[0] || '')}"></label>
       <label>שעה<input type="time" id="f-rt" value="${esc((it.remindAt || '').split('T')[1] || '08:00')}"></label></div>
-      <div style="font-size:13px;color:#4B5563">למי לשלוח? (ברירת מחדל: האחראים)</div>
-      <div class="checks">${S.team.map(t => `<label><input type="checkbox" name="remindTo" value="${esc(t.name)}" ${(it.remindTo || []).includes(t.name) ? 'checked' : ''}> ${esc(t.name)}</label>`).join('')}</div>
+      <div id="remto-box" ${it.private ? 'hidden' : ''}><div style="font-size:13px;color:#4B5563">למי לשלוח? (ברירת מחדל: האחראים)</div>
+      <div class="checks">${S.team.map(t => `<label><input type="checkbox" name="remindTo" value="${esc(t.name)}" ${(it.remindTo || []).includes(t.name) ? 'checked' : ''}> ${esc(t.name)}</label>`).join('')}</div></div>
       ${it.remindAt ? `<button class="btn ghost sm" data-act="clearRemind" type="button">בטל תזכורת</button>` : ''}
     </fieldset>
     <div class="row"><button class="btn sp" data-act="saveItemForm" data-id="${id || ''}">שמירה</button>
@@ -460,7 +644,7 @@ function sheetSub(id) {
     <label>מחיר / תנאים<input type="text" id="s-price" value="${esc(s.price || '')}" placeholder="למשל: 180,000 ₪ או דקל פחות 15%"></label>
     <div style="font-size:13px;color:#4B5563">אחריות</div>${ownersChecks(s.owners)}
     <label>הערה<textarea id="s-note">${esc(s.note || '')}</textarea></label>
-    <div class="row"><button class="btn sp" data-act="saveSub">שמירה</button><button class="btn wa" data-act="saveSub" data-v="wa">שמור ושלח בוואטסאפ</button>
+    <div class="row"><button class="btn sp" data-act="saveSub">שמירה</button>${waButtons(s.owners, 'saveSub')}
     ${id ? `<button class="btn danger" data-act="delSub" data-id="${id}">מחיקה</button>` : ''}</div>`);
 }
 
@@ -479,11 +663,13 @@ function sheetWho() {
     <button class="btn ghost" data-act="iAm" data-v="">אני לא ברשימה – להוסיף אותי</button></div>`);
 }
 
+const teamRow = (t = {}, d = 0) => `<div class="trow"><input type="text" placeholder="שם" value="${esc(t.name || '')}" data-team="name"><input type="email" placeholder="מייל" value="${esc(t.email || '')}" data-team="email" dir="ltr"><input type="tel" placeholder="טלפון" value="${esc(t.phone || '')}" data-team="phone" dir="ltr"><span class="dev ${t.name ? (d ? 'on' : 'off') : ''}" title="מכשירים עם התראות">${t.name ? `🔔 ${d}` : ''}</span></div>`;
 function sheetTeam() {
-  const rows = [...S.team, { name: '', email: '' }];
+  const rows = [...S.team, { name: '', email: '', phone: '' }];
+  const dev = name => S.tokens.filter(t => t.name === name).length;
   openSheet(`${head('אנשי הצוות')}
-    <p class="sub" style="margin:0">השם מופיע באחריות על משימות. המייל מחבר בין החשבון שמתחבר לבין השם. ההרשאה לכניסה עצמה מוגדרת ב-Firebase.</p>
-    <div id="team-rows" style="display:flex;flex-direction:column;gap:8px">${rows.map(t => `<div class="two"><input type="text" placeholder="שם" value="${esc(t.name)}" data-team="name"><input type="email" placeholder="מייל" value="${esc(t.email || '')}" data-team="email" dir="ltr"></div>`).join('')}</div>
+    <p class="sub" style="margin:0">השם מופיע באחריות על משימות. המייל מחבר בין החשבון לשם. הטלפון משמש לכפתור הוואטסאפ. 🔔 = בכמה מכשירים הופעלו התראות.</p>
+    <div id="team-rows" style="display:flex;flex-direction:column;gap:8px">${rows.map(t => teamRow(t, dev(t.name))).join('')}</div>
     <button class="btn ghost sm" data-act="teamRow">+ עוד שורה</button>
     <button class="btn" data-act="saveTeam">שמירה</button>`);
 }
@@ -493,7 +679,7 @@ async function seed() {
   const b = writeBatch(db);
   SEED_PROJECTS.forEach(p => b.set(doc(db, 'projects', p.id), { name: p.name, order: p.order, archived: false }));
   SEED_ITEMS.forEach(([projectId, text, kind, owners, due = '', urgent = false, note = '']) => {
-    b.set(doc(collection(db, 'items')), { projectId, text, kind, owners, due, dueOrig: due, urgent, note, status: 'open', createdAt: serverTimestamp(), updatedAt: serverTimestamp(), updatedBy: me() });
+    b.set(doc(collection(db, 'items')), { projectId, text, kind, owners, due, dueOrig: due, urgent, note, status: 'open', private: false, ownerUid: S.user.uid, createdBy: me(), createdAt: serverTimestamp(), updatedAt: serverTimestamp(), updatedBy: me() });
   });
   SEED_SUBS.forEach(([projectId, trade, contractors, stage, note, owners]) => {
     b.set(doc(collection(db, 'subs')), { projectId, trade, contractors, stage, note, owners, price: '', updatedAt: serverTimestamp() });
@@ -517,7 +703,7 @@ async function handle(act, el) {
       break;
     }
     case 'logout': await signOut(auth); break;
-    case 'tab': S.tab = v; localStorage.setItem('tab', v); render(); window.scrollTo(0, 0); break;
+    case 'tab': if (S.mEdit) await mSave(); if (v === 'meeting' && S.tab === 'meeting') { S.mEdit = null; S.autoSum = false; } S.tab = v; localStorage.setItem('tab', v); render(true); window.scrollTo(0, 0); break;
     case 'fPerson': S.fPerson = v; render(); break;
     case 'fDone': S.fShowDone = !S.fShowDone; render(); break;
     case 'enablePush': el.disabled = true; await enablePush(); break;
@@ -537,10 +723,11 @@ async function handle(act, el) {
     case 'newProject': sheetProject(null); break;
     case 'editProject': sheetProject(id); break;
     case 'team': sheetTeam(); break;
-    case 'teamRow': document.getElementById('team-rows').insertAdjacentHTML('beforeend', `<div class="two"><input type="text" placeholder="שם" data-team="name"><input type="email" placeholder="מייל" data-team="email" dir="ltr"></div>`); break;
+    case 'teamRow': document.getElementById('team-rows').insertAdjacentHTML('beforeend', teamRow()); break;
     case 'st':
       draft.status = v;
       $sheet.querySelectorAll('[data-act=st]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === v)));
+      { const w = document.getElementById('why-box'); if (w) { w.hidden = v !== 'stuck'; if (v === 'stuck') document.getElementById('f-why').focus(); } }
       break;
     case 'stage':
       draft.stage = Number(v);
@@ -552,15 +739,18 @@ async function handle(act, el) {
       const dueEl = document.getElementById('f-due');
       const upd = { note, updatedAt: serverTimestamp(), updatedBy: me() };
       if (it.kind === 'task') {
+        const why = (document.getElementById('f-why') || {}).value || '';
+        if (draft.status === 'stuck' && !why.trim()) { toast('כתבו למה המשימה תקועה'); document.getElementById('f-why').focus(); return; }
+        upd.stuckReason = draft.status === 'stuck' ? why.trim() : '';
         upd.status = draft.status;
         if (draft.status === 'done' && it.status !== 'done') upd.doneAt = serverTimestamp();
         if (dueEl) upd.due = dueEl.value;
       }
       await updateDoc(doc(db, 'items', it.id), upd);
-      const msg = `${projName(it.projectId)} | ${it.text}${it.kind === 'task' ? ` ← ${STATUS[draft.status]}` : ''}${note && note !== it.note ? ` · ${note}` : ''}`;
-      await logUpdate(msg, { type: 'item', id: it.id });
+      const msg = `${projName(it.projectId)} | ${it.text}${it.kind === 'task' ? ` ← ${STATUS[draft.status]}` : ''}${upd.stuckReason ? ` (סיבה: ${upd.stuckReason})` : ''}${note && note !== it.note ? ` · ${note}` : ''}`;
+      if (!it.private) await logUpdate(msg, { type: 'item', id: it.id });
       closeSheet(); toast('העדכון נשמר ומופיע אצל כולם');
-      if (v === 'wa') window.open(waLink(`עדכון מ${me()}: ${msg}`), '_blank');
+      if (v && v.startsWith('wa:')) { const t = S.team.find(x => x.name === v.slice(3)); window.open(waLink(`עדכון מ${me()}: ${msg}`, waPhone(t && t.phone)), '_blank'); }
       break;
     }
     case 'saveItemForm': {
@@ -573,13 +763,17 @@ async function handle(act, el) {
       };
       const rd = document.getElementById('f-rd').value, rt = document.getElementById('f-rt').value || '08:00';
       const old = id ? S.items.find(x => x.id === id) : {};
+      data.private = document.getElementById('f-priv').checked;
+      if (data.private) data.owners = [me()];
       data.remindAt = rd ? `${rd}T${rt}` : '';
-      data.remindTo = rd ? (vals('remindTo').length ? vals('remindTo') : data.owners.filter(o => o !== 'כולם')) : [];
+      data.remindTo = !rd ? [] : data.private ? [me()] : (vals('remindTo').length ? vals('remindTo') : data.owners.filter(o => o !== 'כולם'));
       if (data.remindAt !== (old.remindAt || '')) data.reminderSent = false;
-      if (id) { await updateDoc(doc(db, 'items', id), data); }
-      else {
-        await addDoc(collection(db, 'items'), { ...data, dueOrig: data.due, status: 'open', createdAt: serverTimestamp() });
-        await logUpdate(`משימה חדשה ב${projName(data.projectId)}: ${text}${data.owners.length ? ` (${data.owners.join(', ')})` : ''}`);
+      if (id) {
+        if (!old.ownerUid) data.ownerUid = S.user.uid;
+        await updateDoc(doc(db, 'items', id), data);
+      } else {
+        await addDoc(collection(db, 'items'), { ...data, ownerUid: S.user.uid, createdBy: me(), dueOrig: data.due, status: 'open', createdAt: serverTimestamp() });
+        if (!data.private) await logUpdate(`משימה חדשה ב${projName(data.projectId)}: ${text}${data.owners.length ? ` (${data.owners.join(', ')})` : ''}`);
       }
       closeSheet(); toast('נשמר');
       break;
@@ -600,7 +794,7 @@ async function handle(act, el) {
       const msg = `${projName(data.projectId)} | קבלן ${trade}${data.contractors ? ` (${data.contractors})` : ''} ← ${stageName(data.stage)}${data.price ? ` · ${data.price}` : ''}`;
       if (!old || old.stage !== data.stage || old.price !== data.price || old.contractors !== data.contractors) await logUpdate(msg, { type: 'sub' });
       closeSheet(); toast('נשמר');
-      if (v === 'wa') window.open(waLink(`עדכון מ${me()}: ${msg}`), '_blank');
+      if (v && v.startsWith('wa:')) { const t = S.team.find(x => x.name === v.slice(3)); window.open(waLink(`עדכון מ${me()}: ${msg}`, waPhone(t && t.phone)), '_blank'); }
       break;
     }
     case 'delSub':
@@ -617,8 +811,8 @@ async function handle(act, el) {
       closeSheet(); toast('נשמר'); break;
     }
     case 'saveTeam': {
-      const names = [...$sheet.querySelectorAll('[data-team=name]')], emails = [...$sheet.querySelectorAll('[data-team=email]')];
-      const team = names.map((n, i) => ({ name: n.value.trim(), email: emails[i].value.trim().toLowerCase() })).filter(t => t.name);
+      const names = [...$sheet.querySelectorAll('[data-team=name]')], emails = [...$sheet.querySelectorAll('[data-team=email]')], phones = [...$sheet.querySelectorAll('[data-team=phone]')];
+      const team = names.map((n, i) => ({ name: n.value.trim(), email: emails[i].value.trim().toLowerCase(), phone: phones[i].value.trim() })).filter(t => t.name);
       await setDoc(doc(db, 'settings', 'main'), { team }, { merge: true });
       closeSheet(); toast('הצוות עודכן'); break;
     }
@@ -630,11 +824,39 @@ async function handle(act, el) {
       await setDoc(doc(db, 'settings', 'main'), { team }, { merge: true });
       closeSheet(); toast('שלום ' + (hit ? hit.name : (S.user.displayName || ''))); setTimeout(refreshPushName, 500); break;
     }
-    case 'print': window.print(); break;
+    case 'print': if (S.mEdit) await mSave(); window.print(); break;
+    case 'autoSum': S.autoSum = true; render(true); break;
+    case 'newMeeting': sheetNewMeeting(); break;
+    case 'createMeeting': {
+      const date = document.getElementById('nm-date').value || today();
+      const mode = ($sheet.querySelector('input[name=nm-mode]:checked') || {}).value || 'empty';
+      const ref = doc(collection(db, 'meetings'));
+      const m = { id: ref.id, date, attendees: document.getElementById('nm-att').value.trim(), sections: newSections(mode), createdBy: me() };
+      await setDoc(ref, { date: m.date, attendees: m.attendees, sections: m.sections, createdBy: me(), createdAt: serverTimestamp(), updatedAt: serverTimestamp(), updatedBy: me() });
+      await logUpdate(`נפתחה פגישה חדשה ל-${fmtFull(date)}`);
+      closeSheet(); S.mEdit = m; S.mDirty = false; S.autoSum = false; render(true); window.scrollTo(0, 0);
+      break;
+    }
+    case 'openMeeting': {
+      const m = S.meetings.find(x => x.id === id); if (!m) return;
+      S.mEdit = JSON.parse(JSON.stringify({ id: m.id, date: m.date, attendees: m.attendees, sections: m.sections || [], createdBy: m.createdBy }));
+      S.mDirty = false; render(true); window.scrollTo(0, 0); break;
+    }
+    case 'mBack': if (S.mEdit) await mSave(); S.mEdit = null; S.autoSum = false; render(true); break;
+    case 'mAddRow': { const [i, k] = v.split('-'); const sec = S.mEdit.sections[+i]; (sec[k] = sec[k] || []).push(emptyRow()); render(true); mSchedule();
+      const ta = document.querySelectorAll(`textarea[data-s="${i}"][data-k="${k}"]`); if (ta.length) ta[ta.length - 1].focus(); break; }
+    case 'mDelRow': { const [i, k, j] = v.split('-'); const row = S.mEdit.sections[+i][k][+j];
+      if ((row.topic || '').trim() && !confirm('למחוק את השורה?')) return;
+      S.mEdit.sections[+i][k].splice(+j, 1); render(true); mSchedule(); break; }
+    case 'mAddSec': S.mEdit.sections.push({ name: 'סעיף חדש', rows: [emptyRow()], subs: [] }); render(true); mSchedule(); break;
+    case 'mDelSec': if (!confirm('למחוק את כל הסעיף, כולל השורות שבו?')) return; S.mEdit.sections.splice(+v, 1); render(true); mSchedule(); break;
+    case 'mDelete':
+      if (!confirm(`למחוק את הפגישה של ${fmtFull(S.mEdit.date)}? אי אפשר לבטל.`)) return;
+      clearTimeout(mTimer); await deleteDoc(doc(db, 'meetings', S.mEdit.id)); S.mEdit = null; S.mDirty = false; render(true); toast('הפגישה נמחקה'); break;
     case 'closeMeeting':
       if (!confirm('לסמן שהפגישה הסתיימה? משימות שבוצעו יירדו מהטבלה של הפגישה הבאה.')) return;
       await setDoc(doc(db, 'settings', 'main'), { lastMeetingAt: serverTimestamp() }, { merge: true });
-      await logUpdate('הפגישה השבועית הסתיימה'); toast('נשמר'); break;
+      await logUpdate('סומן "סיימנו פגישה" בתמונת המצב'); toast('נשמר'); break;
   }
 }
 
@@ -652,9 +874,11 @@ document.addEventListener('submit', async e => {
   try { await signInWithEmailAndPassword(auth, document.getElementById('l-email').value.trim(), document.getElementById('l-pass').value); }
   catch (err) { renderLogin(authMsg(err)); }
 });
+document.addEventListener('input', e => { if (e.target.dataset && e.target.dataset.m) onMeetingInput(e.target); });
+window.addEventListener('beforeunload', e => { if (S.mDirty) { mSave(); e.preventDefault(); e.returnValue = ''; } });
 document.addEventListener('change', e => {
   const a = e.target.dataset && e.target.dataset.act;
-  if (a === 'meetingDate') { S.meetingDate = e.target.value || today(); render(); }
+  if (e.target.id === 'f-priv') { const on = e.target.checked; ['owners-box', 'remto-box'].forEach(x => { const el = document.getElementById(x); if (el) el.hidden = on; }); }
   if (a === 'fPersonSel') { S.fPerson = e.target.value; render(); }
   if (a === 'fProjectSel') { S.fProject = e.target.value; render(); }
 });

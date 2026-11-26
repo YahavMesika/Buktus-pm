@@ -121,7 +121,7 @@ h2{font-size:18px;margin:0;font-weight:800}
 .seg.five{grid-template-columns:repeat(3,minmax(0,1fr))}
 .seg.five button[aria-pressed=true]{border-color:var(--blue);background:var(--s-progress-bg);color:var(--s-progress)}
 label{font-size:13px;color:var(--mut);display:flex;flex-direction:column;gap:4px}
-input[type=text],input[type=date],input[type=email],input[type=password],input[type=time],select,textarea{border:1px solid #D1D5DB;border-radius:10px;padding:10px 12px;min-height:44px;background:#fff;width:100%}
+input[type=text],input[type=date],input[type=email],input[type=password],input[type=time],input[type=tel],select,textarea{border:1px solid #D1D5DB;border-radius:10px;padding:10px 12px;min-height:44px;background:#fff;width:100%}
 textarea{min-height:70px;resize:vertical}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .checks{display:flex;flex-wrap:wrap;gap:6px}
@@ -177,3 +177,36 @@ fieldset.rem legend{font-weight:700;font-size:14px;padding:0 6px}
 .tabs button{flex:0 0 auto}
 .filters{grid-template-columns:repeat(2,minmax(0,1fr));max-width:560px}
 .pushb{background:#EEF2FF;border:1px solid #C7D2FE;border-radius:12px;padding:10px 14px;display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;font-size:14px;margin-bottom:10px}
+
+/* stuck reason, private */
+.why{font-size:13px;background:#FFF7ED;color:#9A3412;border-radius:8px;padding:6px 10px;margin-top:2px}
+.whyl textarea{border-color:#FDBA74}
+.privl{flex-direction:row!important;align-items:center;gap:8px;background:var(--soft);border-radius:10px;padding:10px 12px;color:var(--ink)!important;font-size:14px!important}
+
+/* team rows */
+.trow{display:grid;grid-template-columns:1fr 1.4fr 1fr 44px;gap:6px;align-items:center}
+.dev{font-size:12px;text-align:center;border-radius:6px;padding:4px 0}
+.dev.on{background:#DCFCE7;color:#166534}.dev.off{background:#FEE2E2;color:#991B1B}
+@media(max-width:560px){.trow{grid-template-columns:1fr 1fr}.trow input[type=email]{grid-column:1/-1;order:3}}
+
+/* meeting editor */
+.mtitle{text-align:center;font-weight:800;font-size:18px;margin:6px 0}
+.matt{font-size:13px;margin-bottom:6px;display:flex;gap:6px;align-items:center}
+.matt input{flex:1;border:none;border-bottom:1px dashed #CBD5E1;background:transparent;padding:4px;min-height:32px;font-size:13px}
+.mstate{font-size:13px;color:var(--mut)}
+.mt.edit td{padding:0}
+.mt.edit td.num{padding:6px 8px;text-align:center;color:#475569}
+.mt.edit input,.mt.edit textarea,.mt.edit select{width:100%;border:none;background:transparent;padding:7px 8px;font-size:13px;min-height:34px;border-radius:0;resize:none;overflow:hidden;line-height:1.45;display:block}
+.mt.edit input:focus,.mt.edit textarea:focus,.mt.edit select:focus{outline:2px solid #93C5FD;outline-offset:-2px;background:#F8FAFF}
+.mt.edit .sec td{padding:0}
+.mt.edit .secname{text-align:center;font-weight:800;font-size:14px;background:#F1F5F9}
+.mt.edit tr.addr td{border:none;padding:4px 8px;background:#fff}
+.mt.edit tr.addr .btn{min-height:30px;padding:4px 10px;font-size:13px}
+.rx{border:none;background:none;color:#9CA3AF;font-size:18px;cursor:pointer;width:34px;height:34px}
+.rx:hover{color:#B91C1C}
+@media print{
+  .emptyrow{display:none}
+  .mt.edit select{appearance:none;-webkit-appearance:none}
+  .matt input{border:none}
+}
+.mt.edit tr.sub td{padding:6px 8px;font-weight:700;text-decoration:underline;font-size:13px}

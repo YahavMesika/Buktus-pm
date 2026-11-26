@@ -1,7 +1,7 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // רק מי שהמייל שלו ברשימה יכול לראות או לשנות משהו
+    // רק מי שהמייל שלו ברשימה יכול להיכנס
     function allowed() {
       return request.auth != null
         && request.auth.token.email.lower() in [
@@ -10,8 +10,20 @@ service cloud.firestore {
           'yahavmesika@gmail.com'
         ];
     }
-    match /{document=**} {
-      allow read, write: if allowed();
+    // משימה פרטית: רק מי שיצר אותה
+    function canSee(data) {
+      return data.private != true || data.ownerUid == request.auth.uid;
     }
+    match /items/{id} {
+      allow read, delete: if allowed() && canSee(resource.data);
+      allow create: if allowed() && canSee(request.resource.data);
+      allow update: if allowed() && canSee(resource.data) && canSee(request.resource.data);
+    }
+    match /projects/{id} { allow read, write: if allowed(); }
+    match /subs/{id} { allow read, write: if allowed(); }
+    match /updates/{id} { allow read, write: if allowed(); }
+    match /meetings/{id} { allow read, write: if allowed(); }
+    match /settings/{id} { allow read, write: if allowed(); }
+    match /tokens/{id} { allow read, write: if allowed(); }
   }
 }

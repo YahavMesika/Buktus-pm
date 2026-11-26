@@ -29,6 +29,14 @@ const team = (settings.team || []).map(t => t.name);
 const tokensOf = name => tokens.filter(t => t.name === name).map(t => t.id);
 const allTokens = () => tokens.map(t => t.id);
 console.log(`${tokens.length} devices, ${items.length} items`);
+const byName = {};
+tokens.forEach(t => { byName[t.name] = (byName[t.name] || 0) + 1; });
+console.log('devices by name:', JSON.stringify(byName));
+
+// משימות ישנות בלי סימון פרטי/כללי: מסמנים כ"כללי" כדי שיופיעו לכולם
+const unmarked = items.filter(it => it.private === undefined);
+for (const it of unmarked) { await it.ref.update({ private: false }); it.private = false; }
+if (unmarked.length) console.log('marked as shared:', unmarked.length);
 
 let sent = 0;
 async function push(toks, title, body, tag) {
@@ -56,10 +64,14 @@ if (FORCE) {
 }
 
 /* 1. תזכורות שהגיע זמנן */
+const pending = items.filter(it => it.remindAt && !it.reminderSent);
+console.log('pending reminders:', pending.map(it => `${it.remindAt} → ${(it.remindTo || it.owners || []).join(',')}`).join(' | ') || 'none');
 for (const it of items) {
   if (!it.remindAt || it.reminderSent || it.remindAt > nowIL) continue;
   const to = (it.remindTo && it.remindTo.length ? it.remindTo : (it.owners || []));
   const names = to.includes('כולם') ? team : to;
+  const missing = names.filter(n => !tokensOf(n).length);
+  if (missing.length) console.log(`  ! no devices for: ${missing.join(', ')}`);
   await push(names.flatMap(tokensOf), `🔔 תזכורת · ${projName[it.projectId] || ''}`, it.text + (it.note ? ` (${it.note})` : ''), 'r-' + it.id);
   await it.ref.update({ reminderSent: true });
   console.log('reminder:', it.text);
